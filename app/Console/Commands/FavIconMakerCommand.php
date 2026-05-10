@@ -4,74 +4,93 @@ namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Str;
 
 class FavIconMakerCommand extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
-    protected $signature = 'app:favicon:make {image? : Path to image file or URL (optional)}';
+    protected $signature = 'app:favicon
+                            {source? : Optional source image path. SVG files are copied; raster files require the GD extension for PNG output.}
+                            {--output=favicon : Directory under public/ where generated assets are written}
+                            {--sizes=16,32,180,192,512 : Comma-separated PNG sizes to generate when GD is available}
+                            {--manifest : Generate a web manifest alongside the favicon assets}
+                            {--dry-run : Show planned files without writing them}
+                            {--png : Legacy compatibility option; PNG files are generated automatically for raster sources}';
 
-    /**
-     * The description of the console command.
-     *
-     * @var string
-     */
-    protected $description = 'Generate favicon from an image. Searches base URL for images if no path provided.';
+    protected $aliases = [
+        'app:favicon:make',
+        'app:make:favicon',
+        'app:auto-create-fav-icon-command',
+    ];
 
-    /**
-     * Execute the console command.
-     */
+    protected $description = 'Generate boilerplate favicon assets from a source image or a default SVG.';
+
     public function handle(): int
     {
-        $imagePath = $this->argument('image');
+        $outputDirectory = public_path(trim((string) $this->option('output'), '/'));
+        $source = $this->resolveSource($this->argument('source'));
+        $sizes = $this->sizes();
 
-        // If no image provided, search base URL for images
-        if (! $imagePath) {
-            $this->info('🔍 Searching base URL for images...');
-            $imagePath = $this->searchForImages();
+        if ($this->option('dry-run')) {
+            $this->line('DRY RUN - no files will be written.');
+            $this->displayPlan($outputDirectory, $source, $sizes);
 
-            if (! $imagePath) {
-                $this->error('❌ No images found. Please provide an image path.');
+            return self::SUCCESS;
+        }
+
+        File::ensureDirectoryExists($outputDirectory);
+
+        if ($source === null) {
+            $this->writeDefaultSvg($outputDirectory);
+            $this->info('Generated default SVG favicon.');
+        } elseif ($this->isSvg($source)) {
+            File::copy($source, $outputDirectory.'/favicon.svg');
+            $this->info('Copied SVG favicon source.');
+        } else {
+            if (! extension_loaded('gd')) {
+                $this->error('The GD extension is required to generate PNG favicons from raster images.');
 
                 return self::FAILURE;
             }
 
-            $this->info("✅ Found image: {$imagePath}");
+            $image = $this->loadRasterImage($source);
+
+            if ($image === null) {
+                $this->error('Unsupported or unreadable image source: '.$source);
+
+                return self::FAILURE;
+            }
+
+            foreach ($sizes as $size) {
+                $this->writePng($image, $size, $outputDirectory."/favicon-{$size}x{$size}.png");
+            }
+
+            imagedestroy($image);
+            $this->info('Generated PNG favicon assets.');
         }
 
-        // Process the image
-        return $this->processFavicon($imagePath);
+        if ($this->option('manifest')) {
+            $this->writeManifest($outputDirectory);
+            $this->info('Generated web manifest.');
+        }
+
+        $this->line('Favicon assets are available in public/'.trim((string) $this->option('output'), '/').'.');
+
+        return self::SUCCESS;
     }
 
-    /**
-     * Search for images in the public directory and base URL
-     */
-    private function searchForImages(): ?string
+    private function resolveSource(?string $source): ?string
     {
-        // Search in public directory first
-        $publicPath = public_path();
-        $imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp'];
+        if (filled($source)) {
+            $path = base_path($source);
 
-        // Priority: logo files, then any image
-        $priority = ['logo', 'icon', 'brand', 'alsarya'];
-
-        foreach ($priority as $keyword) {
-            foreach ($imageExtensions as $ext) {
-                $files = glob("{$publicPath}/**/{$keyword}*.{$ext}", GLOB_BRACE);
-                if (! empty($files)) {
-                    return $files[0];
-                }
-            }
+            return File::exists($path) ? $path : $source;
         }
 
-        // If no priority matches, find any image
-        foreach ($imageExtensions as $ext) {
-            $files = glob("{$publicPath}/**/*.{$ext}", GLOB_BRACE);
-            if (! empty($files)) {
-                return $files[0];
+        foreach (['logo.svg', 'logo.png', 'logo.jpg', 'logo.jpeg', 'icon.svg', 'icon.png'] as $candidate) {
+            $path = public_path($candidate);
+
+            if (File::exists($path)) {
+                return $path;
             }
         }
 
@@ -79,212 +98,117 @@ class FavIconMakerCommand extends Command
     }
 
     /**
-     * Process and create favicon from image
+     * @return array<int, int>
      */
-    private function processFavicon(string $imagePath): int
+    private function sizes(): array
     {
-        // Validate image exists
-        if (! file_exists($imagePath) && ! filter_var($imagePath, FILTER_VALIDATE_URL)) {
-            $this->error("❌ Image not found: {$imagePath}");
-
-            return self::FAILURE;
-        }
-
-        try {
-            // Download if URL
-            if (filter_var($imagePath, FILTER_VALIDATE_URL)) {
-                $this->info('📥 Downloading image from URL...');
-                $imageData = file_get_contents($imagePath);
-                if (! $imageData) {
-                    throw new \Exception('Failed to download image');
-                }
-                $tmpFile = tempnam(sys_get_temp_dir(), 'favicon');
-                file_put_contents($tmpFile, $imageData);
-                $imagePath = $tmpFile;
-            }
-
-            // Load image
-            $imageInfo = @getimagesize($imagePath);
-            if (! $imageInfo) {
-                throw new \Exception('Invalid image file');
-            }
-
-            $imageType = $imageInfo[2];
-            $supportedTypes = [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_GIF, IMAGETYPE_WEBP];
-
-            if (! in_array($imageType, $supportedTypes)) {
-                throw new \Exception('Unsupported image type. Supported: JPG, PNG, GIF, WEBP');
-            }
-
-            // Load image based on type
-            $image = match ($imageType) {
-                IMAGETYPE_JPEG => imagecreatefromjpeg($imagePath),
-                IMAGETYPE_PNG => imagecreatefrompng($imagePath),
-                IMAGETYPE_GIF => imagecreatefromgif($imagePath),
-                IMAGETYPE_WEBP => imagecreatefromwebp($imagePath),
-                default => throw new \Exception('Unsupported image type'),
-            };
-
-            if (! $image) {
-                throw new \Exception('Failed to load image');
-            }
-
-            // Create favicon sizes
-            $this->info('🎨 Creating favicon variants...');
-
-            $faviconDir = public_path('favicon');
-            if (! is_dir($faviconDir)) {
-                mkdir($faviconDir, 0755, true);
-            }
-
-            // Standard favicon sizes
-            $sizes = [
-                'favicon-16x16.png' => 16,
-                'favicon-32x32.png' => 32,
-                'apple-touch-icon.png' => 180,
-                'android-chrome-192x192.png' => 192,
-                'android-chrome-512x512.png' => 512,
-            ];
-
-            foreach ($sizes as $filename => $size) {
-                $this->createResizedIcon($image, $size, "{$faviconDir}/{$filename}");
-                $this->line("  ✓ Created {$filename}");
-            }
-
-            // Create ICO format (classic favicon)
-            $this->createIcoFavicon($image, "{$faviconDir}/favicon.ico");
-            $this->line('  ✓ Created favicon.ico');
-
-            // Create WebP versions
-            $webpSizes = [
-                'favicon-192.webp' => 192,
-                'favicon-512.webp' => 512,
-            ];
-
-            foreach ($webpSizes as $filename => $size) {
-                $this->createResizedIcon($image, $size, "{$faviconDir}/{$filename}", 'webp');
-                $this->line("  ✓ Created {$filename}");
-            }
-
-            // Create webmanifest.json
-            $this->createManifest($faviconDir);
-            $this->line('  ✓ Created site.webmanifest');
-
-            imagedestroy($image);
-            if (isset($tmpFile)) {
-                unlink($tmpFile);
-            }
-
-            $this->info('✅ Favicon created successfully!');
-            $this->info('📝 Add this to your HTML head:');
-            $this->line('  <link rel="icon" type="image/png" sizes="32x32" href="/favicon/favicon-32x32.png">');
-            $this->line('  <link rel="icon" type="image/png" sizes="16x16" href="/favicon/favicon-16x16.png">');
-            $this->line('  <link rel="apple-touch-icon" href="/favicon/apple-touch-icon.png">');
-            $this->line('  <link rel="manifest" href="/favicon/site.webmanifest">');
-
-            return self::SUCCESS;
-        } catch (\Throwable $e) {
-            $this->error("❌ Error: {$e->getMessage()}");
-
-            return self::FAILURE;
-        }
+        return collect(explode(',', (string) $this->option('sizes')))
+            ->map(fn (string $size): int => (int) trim($size))
+            ->filter(fn (int $size): bool => $size > 0)
+            ->unique()
+            ->values()
+            ->all();
     }
 
     /**
-     * Create resized icon image
+     * @param  array<int, int>  $sizes
      */
-    private function createResizedIcon($sourceImage, int $size, string $outputPath, string $format = 'png'): void
+    private function displayPlan(string $outputDirectory, ?string $source, array $sizes): void
     {
-        $resized = imagecreatetruecolor($size, $size);
+        $this->line('Source: '.($source ?? 'default generated SVG'));
+        $this->line('Output: '.$outputDirectory);
 
-        // Preserve transparency
-        if ($format === 'png' || $format === 'webp') {
-            imagecolortransparent($resized, imagecolorallocatealpha($resized, 0, 0, 0, 127));
-            imagesavealpha($resized, true);
+        if ($source === null || $this->isSvg($source)) {
+            $this->line('Would write: favicon.svg');
+        } else {
+            foreach ($sizes as $size) {
+                $this->line("Would write: favicon-{$size}x{$size}.png");
+            }
         }
 
-        // Get original dimensions
-        $width = imagesx($sourceImage);
-        $height = imagesy($sourceImage);
+        if ($this->option('manifest')) {
+            $this->line('Would write: site.webmanifest');
+        }
+    }
 
-        // Copy and resize
-        imagecopyresampled(
-            $resized, $sourceImage,
-            0, 0, 0, 0,
-            $size, $size,
-            $width, $height
-        );
+    private function isSvg(string $path): bool
+    {
+        return Str::lower(pathinfo($path, PATHINFO_EXTENSION)) === 'svg';
+    }
 
-        // Save
-        match ($format) {
-            'png' => imagepng($resized, $outputPath),
-            'webp' => imagewebp($resized, $outputPath, 80),
-            default => imagepng($resized, $outputPath),
+    private function writeDefaultSvg(string $outputDirectory): void
+    {
+        $appName = (string) config('app.name', 'Laravel');
+        $initials = Str::of($appName)
+            ->explode(' ')
+            ->filter()
+            ->take(2)
+            ->map(fn (string $word): string => Str::upper(Str::substr($word, 0, 1)))
+            ->implode('');
+
+        $label = e($initials !== '' ? $initials : 'L');
+
+        File::put($outputDirectory.'/favicon.svg', <<<SVG
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="{$label}">
+    <rect width="64" height="64" rx="14" fill="#f97316"/>
+    <text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle" font-family="Arial, sans-serif" font-size="28" font-weight="700" fill="#ffffff">{$label}</text>
+</svg>
+SVG);
+    }
+
+    /**
+     * @return resource|null
+     */
+    private function loadRasterImage(string $source): mixed
+    {
+        $extension = Str::lower(pathinfo($source, PATHINFO_EXTENSION));
+
+        return match ($extension) {
+            'jpg', 'jpeg' => imagecreatefromjpeg($source) ?: null,
+            'png' => imagecreatefrompng($source) ?: null,
+            'webp' => function_exists('imagecreatefromwebp') ? imagecreatefromwebp($source) ?: null : null,
+            default => null,
         };
-
-        imagedestroy($resized);
     }
 
     /**
-     * Create ICO format favicon
+     * @param  resource  $image
      */
-    private function createIcoFavicon($sourceImage, string $outputPath): void
+    private function writePng(mixed $image, int $size, string $path): void
     {
-        // Create 32x32 for ICO
-        $ico = imagecreatetruecolor(32, 32);
-        $width = imagesx($sourceImage);
-        $height = imagesy($sourceImage);
+        $canvas = imagecreatetruecolor($size, $size);
+        imagealphablending($canvas, false);
+        imagesavealpha($canvas, true);
 
-        imagecopyresampled(
-            $ico, $sourceImage,
-            0, 0, 0, 0,
-            32, 32,
-            $width, $height
-        );
+        $transparent = imagecolorallocatealpha($canvas, 255, 255, 255, 127);
+        imagefilledrectangle($canvas, 0, 0, $size, $size, $transparent);
 
-        // Save as PNG first, browsers understand PNG favicons
-        imagepng($ico, $outputPath);
-        imagedestroy($ico);
+        $sourceWidth = imagesx($image);
+        $sourceHeight = imagesy($image);
+        $scale = min($size / $sourceWidth, $size / $sourceHeight);
+        $targetWidth = (int) round($sourceWidth * $scale);
+        $targetHeight = (int) round($sourceHeight * $scale);
+        $targetX = (int) floor(($size - $targetWidth) / 2);
+        $targetY = (int) floor(($size - $targetHeight) / 2);
+
+        imagecopyresampled($canvas, $image, $targetX, $targetY, 0, 0, $targetWidth, $targetHeight, $sourceWidth, $sourceHeight);
+        imagepng($canvas, $path);
+        imagedestroy($canvas);
     }
 
-    /**
-     * Create web manifest file
-     */
-    private function createManifest(string $faviconDir): void
+    private function writeManifest(string $outputDirectory): void
     {
         $manifest = [
-            'name' => config('app.name', 'AlSarya'),
-            'short_name' => 'AlSarya',
+            'name' => config('app.name', 'Laravel'),
+            'short_name' => config('app.name', 'Laravel'),
             'icons' => [
-                [
-                    'src' => '/favicon/android-chrome-192x192.png',
-                    'sizes' => '192x192',
-                    'type' => 'image/png',
-                ],
-                [
-                    'src' => '/favicon/android-chrome-512x512.png',
-                    'sizes' => '512x512',
-                    'type' => 'image/png',
-                ],
-                [
-                    'src' => '/favicon/favicon-192.webp',
-                    'sizes' => '192x192',
-                    'type' => 'image/webp',
-                ],
-                [
-                    'src' => '/favicon/favicon-512.webp',
-                    'sizes' => '512x512',
-                    'type' => 'image/webp',
-                ],
+                ['src' => '/favicon/favicon.svg', 'sizes' => 'any', 'type' => 'image/svg+xml'],
             ],
-            'theme_color' => '#0f172a',
+            'theme_color' => '#ffffff',
             'background_color' => '#ffffff',
             'display' => 'standalone',
         ];
 
-        file_put_contents(
-            "{$faviconDir}/site.webmanifest",
-            json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
-        );
+        File::put($outputDirectory.'/site.webmanifest', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES).PHP_EOL);
     }
 }
