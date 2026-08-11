@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 
 class FavIconMakerCommand extends Command
 {
@@ -26,9 +27,30 @@ class FavIconMakerCommand extends Command
 
     public function handle(): int
     {
-        $outputDirectory = public_path(trim((string) $this->option('output'), '/'));
+        $outputPath = trim((string) $this->option('output'), '/');
+
+        if ($outputPath === '') {
+            $this->error('The output directory cannot be empty.');
+
+            return self::FAILURE;
+        }
+
+        $outputDirectory = public_path($outputPath);
         $source = $this->resolveSource($this->argument('source'));
-        $sizes = $this->sizes();
+
+        try {
+            $sizes = $this->sizes();
+        } catch (InvalidArgumentException $exception) {
+            $this->error($exception->getMessage());
+
+            return self::FAILURE;
+        }
+
+        if (filled($this->argument('source')) && $source === null) {
+            $this->error('Source image not found: '.$this->argument('source'));
+
+            return self::FAILURE;
+        }
 
         if ($this->option('dry-run')) {
             $this->line('DRY RUN - no files will be written.');
@@ -61,7 +83,12 @@ class FavIconMakerCommand extends Command
             }
 
             foreach ($sizes as $size) {
-                $this->writePng($image, $size, $outputDirectory."/favicon-{$size}x{$size}.png");
+                if (! $this->writePng($image, $size, $outputDirectory."/favicon-{$size}x{$size}.png")) {
+                    imagedestroy($image);
+                    $this->error("Unable to write favicon-{$size}x{$size}.png.");
+
+                    return self::FAILURE;
+                }
             }
 
             imagedestroy($image);
@@ -69,11 +96,11 @@ class FavIconMakerCommand extends Command
         }
 
         if ($this->option('manifest')) {
-            $this->writeManifest($outputDirectory);
+            $this->writeManifest($outputDirectory, $outputPath, $source, $sizes);
             $this->info('Generated web manifest.');
         }
 
-        $this->line('Favicon assets are available in public/'.trim((string) $this->option('output'), '/').'.');
+        $this->line('Favicon assets are available in public/'.$outputPath.'.');
 
         return self::SUCCESS;
     }
@@ -81,9 +108,9 @@ class FavIconMakerCommand extends Command
     private function resolveSource(?string $source): ?string
     {
         if (filled($source)) {
-            $path = base_path($source);
+            $path = Str::startsWith($source, DIRECTORY_SEPARATOR) ? $source : base_path($source);
 
-            return File::exists($path) ? $path : $source;
+            return File::exists($path) ? $path : null;
         }
 
         foreach (['logo.svg', 'logo.png', 'logo.jpg', 'logo.jpeg', 'icon.svg', 'icon.png'] as $candidate) {
@@ -104,9 +131,10 @@ class FavIconMakerCommand extends Command
     {
         return collect(explode(',', (string) $this->option('sizes')))
             ->map(fn (string $size): int => (int) trim($size))
-            ->filter(fn (int $size): bool => $size > 0)
+            ->filter(fn (int $size): bool => $size > 0 && $size <= 1024)
             ->unique()
             ->values()
+            ->whenEmpty(fn (): never => throw new InvalidArgumentException('Provide at least one valid favicon size between 1 and 1024 pixels.'))
             ->all();
     }
 
@@ -174,7 +202,7 @@ SVG);
     /**
      * @param  resource  $image
      */
-    private function writePng(mixed $image, int $size, string $path): void
+    private function writePng(mixed $image, int $size, string $path): bool
     {
         $canvas = imagecreatetruecolor($size, $size);
         imagealphablending($canvas, false);
@@ -192,18 +220,34 @@ SVG);
         $targetY = (int) floor(($size - $targetHeight) / 2);
 
         imagecopyresampled($canvas, $image, $targetX, $targetY, 0, 0, $targetWidth, $targetHeight, $sourceWidth, $sourceHeight);
-        imagepng($canvas, $path);
+        $written = imagepng($canvas, $path);
         imagedestroy($canvas);
+
+        return $written;
     }
 
-    private function writeManifest(string $outputDirectory): void
+    /**
+     * @param  array<int, int>  $sizes
+     */
+    private function writeManifest(string $outputDirectory, string $outputPath, ?string $source, array $sizes): void
     {
+        $icons = $source === null || $this->isSvg($source)
+            ? [
+                ['src' => "/{$outputPath}/favicon.svg", 'sizes' => 'any', 'type' => 'image/svg+xml'],
+            ]
+            : collect($sizes)
+                ->map(fn (int $size): array => [
+                    'src' => "/{$outputPath}/favicon-{$size}x{$size}.png",
+                    'sizes' => "{$size}x{$size}",
+                    'type' => 'image/png',
+                ])
+                ->values()
+                ->all();
+
         $manifest = [
             'name' => config('app.name', 'Laravel'),
             'short_name' => config('app.name', 'Laravel'),
-            'icons' => [
-                ['src' => '/favicon/favicon.svg', 'sizes' => 'any', 'type' => 'image/svg+xml'],
-            ],
+            'icons' => $icons,
             'theme_color' => '#ffffff',
             'background_color' => '#ffffff',
             'display' => 'standalone',

@@ -8,6 +8,7 @@ beforeEach(function (): void {
         base_path('.env.target.test'),
         base_path('VERSION.test'),
         base_path('version.test.json'),
+        base_path('favicon-source.svg'),
     ] as $path) {
         File::delete($path);
     }
@@ -21,6 +22,7 @@ afterEach(function (): void {
         base_path('.env.target.test'),
         base_path('VERSION.test'),
         base_path('version.test.json'),
+        base_path('favicon-source.svg'),
     ] as $path) {
         File::delete($path);
     }
@@ -73,12 +75,48 @@ test('version command bumps and synchronizes version files', function (): void {
         ]);
 });
 
-test('favicon command generates a default svg favicon', function (): void {
+test('favicon command generates a default svg favicon and manifest', function (): void {
     $this->artisan('app:make:favicon', [
         '--output' => 'favicon-test',
         '--png' => true,
+        '--manifest' => true,
     ])->assertSuccessful();
 
     expect(File::exists(public_path('favicon-test/favicon.svg')))->toBeTrue()
-        ->and(File::get(public_path('favicon-test/favicon.svg')))->toContain('<svg');
+        ->and(File::get(public_path('favicon-test/favicon.svg')))->toContain('<svg')
+        ->and(File::json(public_path('favicon-test/site.webmanifest'))['icons'][0])
+        ->toMatchArray([
+            'src' => '/favicon-test/favicon.svg',
+            'sizes' => 'any',
+            'type' => 'image/svg+xml',
+        ]);
+});
+
+test('favicon command copies an svg source from a relative path', function (): void {
+    File::put(base_path('favicon-source.svg'), '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+
+    $this->artisan('app:favicon', [
+        'source' => 'favicon-source.svg',
+        '--output' => 'favicon-test',
+    ])->assertSuccessful();
+
+    expect(File::get(public_path('favicon-test/favicon.svg')))->toContain('http://www.w3.org/2000/svg');
+});
+
+test('favicon command fails when the source image is missing', function (): void {
+    $this->artisan('app:favicon', [
+        'source' => 'missing-favicon.svg',
+        '--output' => 'favicon-test',
+    ])->assertFailed();
+
+    expect(File::exists(public_path('favicon-test/favicon.svg')))->toBeFalse();
+});
+
+test('favicon command requires at least one valid size', function (): void {
+    $this->artisan('app:favicon', [
+        '--output' => 'favicon-test',
+        '--sizes' => '0,-4,2048',
+    ])->assertFailed();
+
+    expect(File::exists(public_path('favicon-test')))->toBeFalse();
 });
